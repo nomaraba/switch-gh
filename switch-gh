@@ -11,6 +11,7 @@ Switch:
 Manage:
     switch-gh list           show tracked accounts and the active one
     switch-gh remove <user>  forget an account (logs it out of gh)
+    switch-gh whoami         show the git identity and the active gh account
 
 Read the full documentation:
     switch-gh docs
@@ -49,6 +50,7 @@ USAGE
   switch-gh <username>       switch gh and git to that account
   switch-gh list             show tracked accounts and the active one
   switch-gh remove <user>    forget an account (logs it out of gh)
+  switch-gh whoami           show the git identity and the active gh account
   switch-gh docs             view this documentation
 
 SETUP AND ADD
@@ -349,6 +351,17 @@ def cmd_remove(args):
     return 0
 
 
+def cmd_whoami(args):
+    active = next((login for login, is_active in gh_users() if is_active), None)
+    git_name, git_email = git_global("user.name"), git_global("user.email")
+    if git_name or git_email:
+        print(f"git identity    : {git_name or '-'} <{git_email or '-'}>")
+    else:
+        print("git identity    : not set (git config --global user.name/user.email)")
+    print(f"gh logged in as : {active or 'none (run: switch-gh setup)'}")
+    return 0
+
+
 def cmd_list(args):
     data = load_config()
     if not data["accounts"]:
@@ -385,7 +398,7 @@ def cmd_docs():
     return 0
 
 
-SUBCOMMANDS = ("setup", "add", "remove", "list")
+SUBCOMMANDS = ("setup", "add", "remove", "list", "whoami")
 
 
 def main():
@@ -411,12 +424,13 @@ def main():
     p_rm.add_argument("--yes", action="store_true", help="skip the confirmation")
 
     sub.add_parser("list", help="show tracked accounts and current state")
+    sub.add_parser("whoami", help="show the git identity and the active gh account")
 
     args = ap.parse_args(argv)
     if args.cmd is None:
         return cmd_list(args)
     return {"setup": cmd_setup, "add": cmd_add, "remove": cmd_remove,
-            "list": cmd_list}[args.cmd](args)
+            "list": cmd_list, "whoami": cmd_whoami}[args.cmd](args)
 
 
 if __name__ == "__main__":

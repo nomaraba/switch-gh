@@ -19,6 +19,7 @@ switch-gh add              # log in another account and record it
 switch-gh <username>       # switch gh and git to that account
 switch-gh list             # show tracked accounts and the active one
 switch-gh remove <user>    # forget an account (logs it out of gh)
+switch-gh whoami           # show the git identity and the active gh account
 switch-gh docs             # view this documentation
 ```
 
