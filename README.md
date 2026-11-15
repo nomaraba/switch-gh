@@ -8,7 +8,8 @@ copied anywhere.
 ## Install
 
 ```bash
-mkdir -p ~/.local/bin && { command -v curl >/dev/null 2>&1 && curl -fsSL https://raw.githubusercontent.com/nomaraba/switch-gh/main/switch-gh -o ~/.local/bin/switch-gh || wget -qO ~/.local/bin/switch-gh https://raw.githubusercontent.com/nomaraba/switch-gh/main/switch-gh; } && chmod +x ~/.local/bin/switch-gh
+curl -fsSL https://raw.githubusercontent.com/nomaraba/switch-gh/main/setup.sh | sh
+# or: wget -qO- https://raw.githubusercontent.com/nomaraba/switch-gh/main/setup.sh | sh
 ```
 
 ## Usage
