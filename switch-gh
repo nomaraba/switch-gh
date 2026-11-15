@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""switch-gh - switch between GitHub accounts for gh and git.
+
+Add accounts:
+    switch-gh setup          first account (runs `gh auth login`)
+    switch-gh add            add another account (same flow)
+
+Switch:
+    switch-gh <username>     make this account active for gh and git
+
+Manage:
+    switch-gh list           show tracked accounts and the active one
+    switch-gh remove <user>  forget an account (logs it out of gh)
+
+Read the full documentation:
+    switch-gh docs
+
+Accounts are stored in ~/.config/switch-gh/accounts.json. Tokens are not
+copied anywhere: `gh` keeps its own credentials, one per account, and
+`switch-gh` only flips which one is active and sets the matching git
+user.name / user.email globally.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "switch-gh"
+CONFIG_FILE = CONFIG_DIR / "accounts.json"
+HOST = "github.com"
+
+DOCS = """switch-gh
+
+Switches GitHub accounts for the gh CLI and for git. It keeps a list of
+accounts in ~/.config/switch-gh/accounts.json and flips the active one.
+gh itself stores the credentials, one per account, so no tokens are
+copied anywhere.
+
+USAGE
+
+  switch-gh setup            log in the first account and record it
+  switch-gh add              log in another account and record it
+  switch-gh <username>       switch gh and git to that account
+  switch-gh list             show tracked accounts and the active one
+  switch-gh remove <user>    forget an account (logs it out of gh)
+  switch-gh docs             view this documentation
+
+SETUP AND ADD
+
+  Both run `gh auth login`, the standard interactive flow of the gh
+  CLI: pick GitHub.com, pick a protocol, authenticate in the browser.
+  When it finishes, switch-gh reads the account back with `gh api user`
+  and asks for the git user.name and user.email to use for commits.
+  The default email is the account's public email if it has one,
+  otherwise the noreply address GitHub provides.
+
+  Logging in a second account also makes it active, same as gh does.
+
+SWITCH
+
+  switch-gh <username>
+      Runs `gh auth switch` so gh commands use that account, then sets
+      user.name / user.email globally so commits carry that identity.
+      The git credential helper points at gh, so pushes also use the
+      active account's token.
+
+  A repository with its own user.name or user.email in .git/config
+  overrides the global identity. switch-gh warns when it sees that in
+  the current repo, because that is how commits end up with the wrong
+  author.
+
+REMOVE
+
+  Asks for confirmation (or takes --yes), runs `gh auth logout` for the
+  account, and drops it from the config. If it was the active one,
+  switch-gh switches to another tracked account.
+
+NOTES
+
+  - GH_TOKEN or GITHUB_TOKEN set in the environment makes gh ignore
+    stored accounts entirely. switch-gh refuses to switch while one is
+    set, instead of switching silently.
+  - The config file holds usernames and git identities only, and can
+    be edited by hand.
+  - Tokens live in gh's own storage; `gh auth status` shows them.
+
+FILES
+
+  ~/.config/switch-gh/accounts.json   account list and active account
+
+AUTHOR
+
+Kasaki Nomaraba
+https://github.com/nomaraba
+"""
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+# config
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text())
+        except (OSError, ValueError):
+            die(f"could not parse {CONFIG_FILE}; fix or delete it")
+        return data
+    return {"accounts": [], "active": None}
+
+
+def save_config(data):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def find_account(data, username):
+    for acc in data["accounts"]:
+        if acc["user"].lower() == username.lower():
+            return acc
+    return None
+
+
+# gh state
+
+def gh_users():
+    """Return [(login, active_bool)] for every account gh knows, or [] if none.
+
+    `gh auth status --json hosts` emits {"hosts": {"github.com": [entry,...]}}
+    with each entry carrying `login` and `active`.
+    """
+    r = run(["gh", "auth", "status", "--json", "hosts"])
+    try:
+        data = json.loads(r.stdout or "")
+    except ValueError:
+        return []
+    users = []
+    for entries in (data.get("hosts") or {}).values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            login = entry.get("login")
+            if login:
+                users.append((login, bool(entry.get("active"))))
+    return users
+
+
+def gh_active():
+    for login, active in gh_users():
+        if active:
+            return login
+    return None
+
+
+def api_user():
+    """Return (login, id, name, email) of the currently active gh account."""
+    r = run(["gh", "api", "user", "--template",
+             "{{.login}}|{{.id}}|{{.name}}|{{.email}}"])
+    if r.returncode != 0:
+        die(f"could not read the logged-in user from gh: {r.stderr.strip()}")
+    login, uid, name, email = (r.stdout.strip().split("|") + ["", "", "", ""])[:4]
+    return login, uid, name, email
+
+
+# git state
+
+def git_global(key):
+    r = run(["git", "config", "--global", "--get", key])
+    return r.stdout.strip() or None
+
+
+def set_git_identity(acc):
+    run(["git", "config", "--global", "user.name", acc["name"]])
+    run(["git", "config", "--global", "user.email", acc["email"]])
+
+
+def credential_helper_ok():
+    r = run(["git", "config", "--global", "--get-regexp",
+             r"credential\..*\.helper|^credential\.helper"])
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def local_override_warning():
+    """Warn when the current repo pins its own user.* config."""
+    if not Path.cwd().joinpath(".git").exists():
+        return
+    r = run(["git", "config", "--local", "--get-regexp", r"^user\.(name|email)$"])
+    if r.returncode == 0 and r.stdout.strip():
+        print("note: this repository has local user.name/user.email set, "
+              "which overrides the global identity here")
+
+
+# login flow
+
+def login_and_store(data, existing=None):
+    """Run `gh auth login` interactively, then record the account."""
+    if not sys.stdin.isatty():
+        die("login needs a terminal; run switch-gh from an interactive shell")
+
+    known = ", ".join(a["user"] for a in data["accounts"]) or "none yet"
+    print(f"Tracked accounts: {known}")
+    print("gh will now walk you through the login. Choose GitHub.com and the "
+          "protocol you use; the rest is upstream gh.\n")
+    rc = subprocess.run(["gh", "auth", "login"]).returncode
+    if rc != 0:
+        die("gh auth login did not finish; nothing recorded")
+
+    login, uid, name, email = api_user()
+
+    if find_account(data, login) and existing is None:
+        existing = find_account(data, login)
+        print(f"{login} is already tracked; refreshing its entry")
+
+    default_name = existing["name"] if existing else (name or login)
+    default_email = existing["email"] if existing else (
+        email or f"{uid}+{login}@users.noreply.github.com"
+    )
+    git_name = prompt_with_default("git user.name", default_name)
+    git_email = prompt_with_default("git user.email", default_email)
+
+    acc = {
+        "user": login,
+        "name": git_name,
+        "email": git_email,
+        "added": existing.get("added") if existing else
+                 datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    data["accounts"] = [a for a in data["accounts"]
+                        if a["user"].lower() != login.lower()]
+    data["accounts"].append(acc)
+    data["active"] = login
+    save_config(data)
+
+    activate(acc, data)
+    print(f"\n'{login}' is active. git commits use {git_name} <{git_email}>.")
+
+
+def prompt_with_default(label, default):
+    raw = input(f"{label} [{default}]: ").strip()
+    return raw or default
+
+
+def activate(acc, data=None):
+    """Point gh and git at this account."""
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        die("GH_TOKEN/GITHUB_TOKEN is set in the environment; gh ignores "
+            "stored accounts while it is. Unset it and retry.")
+    users = dict((l.lower(), active) for l, active in gh_users())
+    if acc["user"].lower() not in users:
+        die(f"gh has no credentials for '{acc['user']}'. "
+            f"Run 'switch-gh add' to log in again.")
+
+    if not users[acc["user"].lower()]:
+        r = run(["gh", "auth", "switch", "--hostname", HOST,
+                 "--user", acc["user"]])
+        if r.returncode != 0:
+            die(f"gh auth switch failed: {r.stderr.strip()}")
+
+    if not credential_helper_ok():
+        r = run(["gh", "auth", "setup-git"])
+        if r.returncode != 0:
+            print(f"warning: gh auth setup-git failed: {r.stderr.strip()}",
+                  file=sys.stderr)
+
+    set_git_identity(acc)
+    if data is not None:
+        data["active"] = acc["user"]
+        save_config(data)
+    print(f"gh active account : {acc['user']}")
+    print(f"git identity      : {acc['name']} <{acc['email']}>")
+
+
+def cmd_switch(args):
+    data = load_config()
+    acc = find_account(data, args.user)
+    if not acc:
+        known = ", ".join(a["user"] for a in data["accounts"]) or "none tracked"
+        die(f"'{args.user}' is not tracked (known: {known}). "
+            f"Run 'switch-gh add' to log in first.")
+    activate(acc, data)
+    local_override_warning()
+    return 0
+
+
+def cmd_setup(args):
+    data = load_config()
+    login_and_store(data)
+    return 0
+
+
+def cmd_add(args):
+    data = load_config()
+    login_and_store(data)
+    return 0
+
+
+def cmd_remove(args):
+    data = load_config()
+    if not args.user:
+        die("usage: switch-gh remove <username> "
+            f"(tracked: {', '.join(a['user'] for a in data['accounts']) or 'none'})")
+    acc = find_account(data, args.user)
+    if not acc:
+        die(f"'{args.user}' is not tracked")
+
+    if not args.yes and sys.stdin.isatty():
+        raw = input(f"Forget '{acc['user']}' and log it out of gh? [y/N] ").strip().lower()
+        if raw not in ("y", "yes"):
+            print("cancelled")
+            return 0
+
+    r = run(["gh", "auth", "logout", "--hostname", HOST, "--user", acc["user"]])
+    if r.returncode != 0:
+        print(f"note: gh logout said: {r.stderr.strip()}", file=sys.stderr)
+
+    data["accounts"] = [a for a in data["accounts"] if a is not acc]
+    was_active = (data.get("active") or "").lower() == acc["user"].lower()
+    save_config(data)
+    print(f"removed '{acc['user']}' from {CONFIG_FILE}")
+
+    if not data["accounts"]:
+        if was_active:
+            print("no accounts left. the global git identity still points at "
+                  f"{acc['name']} <{acc['email']}>; change it with "
+                  "'git config --global user.name/user.email'")
+        return 0
+
+    if was_active:
+        nxt = data["accounts"][0]
+        print(f"switching to '{nxt['user']}'")
+        try:
+            activate(nxt, data)
+        except SystemExit:
+            print(f"could not activate '{nxt['user']}'; "
+                  "run 'switch-gh <user>' or 'switch-gh add'")
+    return 0
+
+
+def cmd_list(args):
+    data = load_config()
+    if not data["accounts"]:
+        print("no accounts tracked. run 'switch-gh setup' to add the first one.")
+        return 0
+
+    gh_now = gh_active()
+    git_name, git_email = git_global("user.name"), git_global("user.email")
+    helper = "configured" if credential_helper_ok() else "NOT configured (run: gh auth setup-git)"
+
+    print("tracked accounts:")
+    for acc in data["accounts"]:
+        marker = "*" if acc["user"].lower() == (data.get("active") or "").lower() else " "
+        gh_state = "active in gh" if acc["user"].lower() == (gh_now or "").lower() \
+            else ("logged in" if any(l.lower() == acc["user"].lower() for l, _ in gh_users())
+                  else "no gh credentials")
+        print(f" {marker} {acc['user']:<16} {gh_state:<16} "
+              f"git: {acc['name']} <{acc['email']}>")
+    print(f"\ngit global identity: {git_name} <{git_email}>")
+    print(f"git credential helper: {helper}")
+    local_override_warning()
+    return 0
+
+
+def cmd_docs():
+    if sys.stdout.isatty():
+        pager = os.environ.get("PAGER") or shutil.which("less") or shutil.which("more")
+        if pager:
+            try:
+                return subprocess.run([pager], input=DOCS, text=True).returncode
+            except FileNotFoundError:
+                pass
+    sys.stdout.write(DOCS)
+    return 0
+
+
+SUBCOMMANDS = ("setup", "add", "remove", "list")
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "docs":
+        return cmd_docs()
+    # a bare username means "switch to that account"
+    if argv and not argv[0].startswith("-") and argv[0] not in SUBCOMMANDS:
+        return cmd_switch(argparse.Namespace(user=argv[0]))
+
+    ap = argparse.ArgumentParser(
+        prog="switch-gh",
+        description="Switch GitHub accounts for gh and git.",
+        epilog="Run 'switch-gh setup' first. Tokens live in gh's own store; "
+               "this tool only tracks accounts and flips the active one.")
+    sub = ap.add_subparsers(dest="cmd")
+
+    sub.add_parser("setup", help="log in the first account and record it")
+    sub.add_parser("add", help="log in another account and record it")
+
+    p_rm = sub.add_parser("remove", help="forget an account and log it out of gh")
+    p_rm.add_argument("user", nargs="?")
+    p_rm.add_argument("--yes", action="store_true", help="skip the confirmation")
+
+    sub.add_parser("list", help="show tracked accounts and current state")
+
+    args = ap.parse_args(argv)
+    if args.cmd is None:
+        return cmd_list(args)
+    return {"setup": cmd_setup, "add": cmd_add, "remove": cmd_remove,
+            "list": cmd_list}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
+    except EOFError:
+        print("\nCancelled.")
+        sys.exit(130)
