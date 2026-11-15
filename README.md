@@ -9,7 +9,6 @@ copied anywhere.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nomaraba/switch-gh/main/setup.sh | sh
-# or: wget -qO- https://raw.githubusercontent.com/nomaraba/switch-gh/main/setup.sh | sh
 ```
 
 ## Usage
